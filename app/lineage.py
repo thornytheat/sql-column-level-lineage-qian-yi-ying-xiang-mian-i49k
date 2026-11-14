@@ -6,6 +6,8 @@
 - 函数包裹（CAST/COALESCE/ROUND/SUM...）保留源列身份，记录由外到内的变换链；
 - 子查询先算内部输出列，再按列名向外传播（不丢源表）；
 - UNION ALL 各分支按列序号对齐到同一目标列；
+- JOIN ON/USING、WHERE、GROUP BY 的列引用解析成「约束引用」（usage 边），
+  归属整条语句的目标对象，同样穿透子查询到基表；
 - 来源表既不在 schema、也不是本批次脚本产出 → 报错并给位置，不静默丢边。
 """
 from __future__ import annotations
@@ -109,11 +111,15 @@ def _kind_of(stmt: parser.Statement) -> str:
     return "view" if stmt.kind == "view" else "table"
 
 
-def _sources(select: parser.Select, catalog: dict[str, list[str]]) -> list[_Source]:
+def _sources(
+    select: parser.Select,
+    catalog: dict[str, list[str]],
+    sink: list[dict] | None = None,
+) -> list[_Source]:
     out: list[_Source] = []
     for idx, ref in enumerate(select.froms):
         if ref.subquery is not None:
-            inner = _resolve_select(ref.subquery, catalog)
+            inner = _resolve_select(ref.subquery, catalog, sink)
             out.append(
                 _Source(
                     name=ref.alias or ref.table or f"sub_{idx + 1}",
@@ -205,6 +211,38 @@ def _output_name(item: parser.SelectItem, refs: list[Ref], index: int) -> str:
     return f"col_{index + 1}"
 
 
+def _resolve_constraint(constraint: parser.ConstraintRef, sources: list[_Source]) -> list[dict]:
+    """把一条约束条件里的列引用解析到基表列（穿透子查询），保留每个引用自己的行号。"""
+    out: list[dict] = []
+    for cr in constraint.refs:
+        src = _match_source(sources, cr.qualifier, cr.column, cr.line, cr.col)
+        if src.outputs is not None:
+            inner = next(c for c in src.outputs if c.name == cr.column)
+            if not inner.refs:
+                raise _LineageError(f"子查询列 {cr.column} 没有可追溯的源列", cr.line, cr.col)
+            for r in inner.refs:
+                out.append(
+                    {
+                        "table": r.table,
+                        "column": r.column,
+                        "usage": constraint.usage,
+                        "expr": constraint.expr,
+                        "line": cr.line,
+                    }
+                )
+        else:
+            out.append(
+                {
+                    "table": src.table or src.name,
+                    "column": cr.column,
+                    "usage": constraint.usage,
+                    "expr": constraint.expr,
+                    "line": cr.line,
+                }
+            )
+    return out
+
+
 def _expand_star(
     item: parser.SelectItem,
     sources: list[_Source],
@@ -269,8 +307,12 @@ def _expand_star(
     return out
 
 
-def _resolve_select(select: parser.Select, catalog: dict[str, list[str]]) -> list[OutCol]:
-    sources = _sources(select, catalog)
+def _resolve_select(
+    select: parser.Select,
+    catalog: dict[str, list[str]],
+    sink: list[dict] | None = None,
+) -> list[OutCol]:
+    sources = _sources(select, catalog, sink)
     cols: list[OutCol] = []
     for idx, item in enumerate(select.items):
         if item.star:
@@ -279,8 +321,12 @@ def _resolve_select(select: parser.Select, catalog: dict[str, list[str]]) -> lis
         refs = _resolve_refs(item, sources)
         cols.append(OutCol(name=_output_name(item, refs, idx), refs=refs))
 
+    if sink is not None:
+        for constraint in select.constraints:
+            sink.extend(_resolve_constraint(constraint, sources))
+
     for bi, branch in enumerate(select.unions, start=1):
-        branch_cols = _resolve_select(branch, catalog)
+        branch_cols = _resolve_select(branch, catalog, sink)
         if len(branch_cols) != len(cols):
             raise _LineageError(
                 f"UNION 分支列数不一致：第 1 个分支 {len(cols)} 列，第 {bi + 1} 个分支 {len(branch_cols)} 列",
@@ -303,8 +349,12 @@ def _resolve_select(select: parser.Select, catalog: dict[str, list[str]]) -> lis
     return cols
 
 
-def _resolve_statement(stmt: parser.Statement, catalog: dict[str, list[str]]) -> list[OutCol]:
-    cols = _resolve_select(stmt.select, catalog)
+def _resolve_statement(
+    stmt: parser.Statement, catalog: dict[str, list[str]]
+) -> tuple[list[OutCol], list[dict]]:
+    """返回（输出列，约束引用列表）；约束引用归属该语句的目标对象。"""
+    sink: list[dict] = []
+    cols = _resolve_select(stmt.select, catalog, sink)
     if stmt.target_columns:
         if len(stmt.target_columns) != len(cols):
             raise _LineageError(
@@ -315,7 +365,7 @@ def _resolve_statement(stmt: parser.Statement, catalog: dict[str, list[str]]) ->
         cols = [
             OutCol(name=stmt.target_columns[i], refs=cols[i].refs) for i in range(len(cols))
         ]
-    return cols
+    return cols, sink
 
 
 def _collect_base_tables(select: parser.Select) -> list[parser.TableRef]:
@@ -385,6 +435,7 @@ def build_lineage(
 
     # 3) 逐条解析血缘，未知表留到下一轮（最多 3 轮）
     resolved: dict[str, list[OutCol]] = {}
+    usages_resolved: dict[str, list[dict]] = {}
     errors: dict[str, Diagnostic] = {}
     unknown: dict[str, Diagnostic] = {}
     pending = [stmt for _, stmt in statements]
@@ -392,7 +443,7 @@ def build_lineage(
         progressed = False
         for stmt in list(pending):
             try:
-                cols = _resolve_statement(stmt, catalog)
+                cols, usages = _resolve_statement(stmt, catalog)
             except _UnknownTable as exc:
                 unknown[stmt.filename] = Diagnostic(
                     filename=stmt.filename,
@@ -413,8 +464,10 @@ def build_lineage(
                 pending.remove(stmt)
                 progressed = True
                 resolved[stmt.filename] = []
+                usages_resolved[stmt.filename] = []
                 continue
             resolved[stmt.filename] = cols
+            usages_resolved[stmt.filename] = usages
             catalog[stmt.target] = [c.name for c in cols]
             pending.remove(stmt)
             progressed = True
@@ -424,6 +477,7 @@ def build_lineage(
         if stmt.filename in unknown:
             errors[stmt.filename] = unknown[stmt.filename]
             resolved[stmt.filename] = []
+            usages_resolved[stmt.filename] = []
             continue
         errors[stmt.filename] = Diagnostic(
             filename=stmt.filename,
@@ -433,10 +487,12 @@ def build_lineage(
             code="unknown_table",
         )
         resolved[stmt.filename] = []
+        usages_resolved[stmt.filename] = []
 
     # 4) 生成边与状态
     table_edges: list[TableEdge] = []
     column_edges: list[ColumnEdge] = []
+    usage_edges: list[dict] = []
     for result in results:
         if result.status == "error":
             continue
@@ -486,12 +542,30 @@ def build_lineage(
                         target_kind=kind,
                     )
                 )
+        seen_usage: set[tuple] = set()
+        for u in usages_resolved.get(result.filename, []):
+            key = (u["table"], u["column"], stmt.target, u["usage"], u["line"])
+            if key in seen_usage:
+                continue
+            seen_usage.add(key)
+            usage_edges.append(
+                {
+                    "source_table": u["table"],
+                    "source_column": u["column"],
+                    "target_table": stmt.target,
+                    "usage": u["usage"],
+                    "script": result.filename,
+                    "line": u["line"],
+                    "expr": u["expr"],
+                }
+            )
 
     diagnostics = [d for d in errors.values()]
     return {
         "scripts": [asdict(s) for s in results],
         "table_edges": [asdict(e) for e in table_edges],
         "column_edges": [asdict(e) for e in column_edges],
+        "usages": usage_edges,
         "target_kinds": target_kind,
         "catalog": {k: v for k, v in catalog.items()},
         "diagnostics": [asdict(d) for d in diagnostics],

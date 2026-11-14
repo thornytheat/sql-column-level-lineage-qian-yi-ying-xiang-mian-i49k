@@ -15,4 +15,4 @@ DATA_DIR = Path(os.environ.get("LINEAGEX_DATA_DIR", PROJECT_DIR / "data"))
 DB_PATH = DATA_DIR / "lineagex.db"
 SAMPLE_DIR = Path(os.environ.get("LINEAGEX_SAMPLE_DIR", PROJECT_DIR / "sample_data"))
 
-SEED_VERSION = "2026-11-14.1"
+SEED_VERSION = "2026-11-14.2"

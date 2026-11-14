@@ -80,6 +80,77 @@ def test_impact_missing_column(analysis):
     assert "没有任何下游边" in impact["message"]
 
 
+def test_impact_covers_join_only_column(analysis):
+    """订单号类列只出现在 JOIN 条件时，下游对象也必须进入影响面。"""
+    _, _, levels = _graph_from(analysis)
+    impact = graph.impact(
+        analysis["table_edges"],
+        analysis["column_edges"],
+        levels,
+        "dws_customer_order",
+        "customer_id",
+        usages=analysis["usages"],
+    )
+    assert impact["found"] is True
+    objects = {it["object"]: it for it in impact["downstream"]}
+    assert set(objects) == {"ads_customer_rank"}
+    hit = objects["ads_customer_rank"]
+    assert hit["relation"] == "direct"
+    assert hit["usages"] == ["join"]
+    assert hit["constraint_refs"][0]["script"] == "10_ads_customer_rank.sql"
+    assert impact["constraint_count"] == 1
+
+
+def test_impact_merges_same_object_by_usage(analysis):
+    """同一对象既有输出列、又在约束里引用时，合并为一个对象、多种用途。"""
+    _, _, levels = _graph_from(analysis)
+    impact = graph.impact(
+        analysis["table_edges"],
+        analysis["column_edges"],
+        levels,
+        "dwd_order",
+        "customer_id",
+        usages=analysis["usages"],
+    )
+    objects = {it["object"]: it for it in impact["downstream"]}
+    assert objects["dws_order_wide"]["usages"] == ["output", "join"]
+    assert objects["dws_customer_order"]["usages"] == ["join"]
+
+
+def test_impact_filter_via_derived_column(analysis):
+    """WHERE 引用派生列时，沿列级血缘传导后并入影响面。"""
+    _, _, levels = _graph_from(analysis)
+    impact = graph.impact(
+        analysis["table_edges"],
+        analysis["column_edges"],
+        levels,
+        "ods_orders",
+        "status",
+        usages=analysis["usages"],
+    )
+    objects = {it["object"]: it for it in impact["downstream"]}
+    assert objects["dws_customer_order"]["usages"] == ["output", "filter"]
+
+
+def test_migration_covers_constraint_only_objects(analysis):
+    _, _, levels = _graph_from(analysis)
+    impact = graph.impact(
+        analysis["table_edges"],
+        analysis["column_edges"],
+        levels,
+        "dws_customer_order",
+        "customer_id",
+        usages=analysis["usages"],
+    )
+    plan = migrate.plan_migration(impact, "drop", None, analysis["cycles"])
+    rewrite_objects = [
+        o["object"] for s in plan["steps"] if s["action"] == "rewrite" for o in s["objects"]
+    ]
+    assert "ads_customer_rank" in rewrite_objects
+    assert plan["steps"][-1]["action"] == "ddl"
+    assert any("ads_customer_rank" in w for w in plan["warnings"])
+
+
 def test_migration_steps_for_drop(analysis):
     _, _, levels = _graph_from(analysis)
     impact = graph.impact(

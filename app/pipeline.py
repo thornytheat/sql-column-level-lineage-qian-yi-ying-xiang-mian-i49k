@@ -71,6 +71,7 @@ def analyze(files: list[dict[str, str]], schemas: dict[str, list[str]]) -> dict:
         "scripts": result["scripts"],
         "table_edges": result["table_edges"],
         "column_edges": result["column_edges"],
+        "usages": result["usages"],
         "diagnostics": result["diagnostics"],
         "parsed_count": result["parsed_count"],
         "failed_count": result["failed_count"],

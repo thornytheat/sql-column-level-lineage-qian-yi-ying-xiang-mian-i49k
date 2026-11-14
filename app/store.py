@@ -8,7 +8,9 @@
 - run_scripts            每个脚本的解析结论（含错误位置）
 - run_table_edges        表级血缘边
 - run_column_edges       列级血缘边（含变换链 / star 标记 / 证据行号）
+- run_usages             约束引用（JOIN ON / WHERE / GROUP BY 里的列引用）
 - run_cycles             环检测结果
+- migration_plans        迁移方案演练结论（按变更键 upsert，失败保留旧版）
 """
 from __future__ import annotations
 
@@ -105,6 +107,34 @@ CREATE TABLE IF NOT EXISTS run_cycles (
   scripts_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rc_run ON run_cycles(run_id);
+
+CREATE TABLE IF NOT EXISTS run_usages (
+  run_id TEXT NOT NULL,
+  source_table TEXT NOT NULL,
+  source_column TEXT NOT NULL,
+  target_table TEXT NOT NULL,
+  usage_kind TEXT NOT NULL,
+  script TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  expr TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ru_run ON run_usages(run_id);
+CREATE INDEX IF NOT EXISTS idx_ru_src ON run_usages(run_id, source_table, source_column);
+
+CREATE TABLE IF NOT EXISTS migration_plans (
+  plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  change_key TEXT NOT NULL UNIQUE,
+  table_name TEXT NOT NULL,
+  column_name TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  new_name TEXT,
+  run_id TEXT NOT NULL,
+  plan_json TEXT NOT NULL,
+  impact_json TEXT NOT NULL,
+  drill_count INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -217,6 +247,21 @@ def save_run(conn: sqlite3.Connection, analysis: dict, source_label: str, durati
                 json.dumps(c.get("scripts", []), ensure_ascii=False),
             ),
         )
+    for u in analysis.get("usages", []):
+        conn.execute(
+            """INSERT INTO run_usages(run_id, source_table, source_column, target_table, usage_kind, script, line, expr)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                run_id,
+                u["source_table"],
+                u["source_column"],
+                u["target_table"],
+                u["usage"],
+                u["script"],
+                u["line"],
+                u["expr"],
+            ),
+        )
     conn.commit()
     return run_id
 
@@ -268,12 +313,23 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
         c["nodes"] = json.loads(c["nodes_json"])
         c["scripts"] = json.loads(c["scripts_json"])
         c["key"] = c["cycle_key"]
+    usages = [
+        dict(r)
+        for r in conn.execute(
+            """SELECT * FROM run_usages WHERE run_id = ?
+               ORDER BY target_table, source_table, source_column, line""",
+            (run_id,),
+        ).fetchall()
+    ]
+    for u in usages:
+        u["usage"] = u.pop("usage_kind")
     return {
         "run": dict(run),
         "scripts": scripts,
         "table_edges": table_edges,
         "column_edges": column_edges,
         "cycles": cycles,
+        "usages": usages,
     }
 
 
@@ -281,6 +337,77 @@ def load_schemas(conn: sqlite3.Connection) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for row in conn.execute("SELECT table_name, columns_json FROM schemas ORDER BY table_name").fetchall():
         out[row["table_name"]] = json.loads(row["columns_json"])
+    return out
+
+
+# --------------------------------------------------------------------------
+# 迁移方案演练结论：同一变更（表+列+动作+新名）只保留一份，重跑就地更新
+# --------------------------------------------------------------------------
+
+def plan_change_key(table: str, column: str, operation: str, new_name: str | None) -> str:
+    return f"{table}|{column}|{operation}|{new_name or ''}"
+
+
+def save_plan(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+    operation: str,
+    new_name: str | None,
+    run_id: str,
+    plan: dict,
+    impact: dict,
+) -> dict:
+    """演练成功后落库：按 change_key upsert，步骤整体替换（不追加、不重复），
+    drill_count 只记录成功演练次数。返回落库后的完整方案行。"""
+    key = plan_change_key(table, column, operation, new_name)
+    ts = now()
+    conn.execute(
+        """INSERT INTO migration_plans(change_key, table_name, column_name, operation, new_name,
+                                      run_id, plan_json, impact_json, drill_count, created_at, updated_at)
+           VALUES(?,?,?,?,?,?,?,?,1,?,?)
+           ON CONFLICT(change_key) DO UPDATE SET
+             run_id = excluded.run_id,
+             plan_json = excluded.plan_json,
+             impact_json = excluded.impact_json,
+             drill_count = migration_plans.drill_count + 1,
+             updated_at = excluded.updated_at""",
+        (
+            key,
+            table,
+            column,
+            operation,
+            new_name,
+            run_id,
+            json.dumps(plan, ensure_ascii=False),
+            json.dumps(impact, ensure_ascii=False),
+            ts,
+            ts,
+        ),
+    )
+    conn.commit()
+    return load_plan(conn, table=table, column=column, operation=operation, new_name=new_name)
+
+
+def load_plan(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+    operation: str,
+    new_name: str | None,
+) -> dict | None:
+    """读取同一变更的历史演练结论（演练失败时用于保留旧版结论）。"""
+    row = conn.execute(
+        "SELECT * FROM migration_plans WHERE change_key = ?",
+        (plan_change_key(table, column, operation, new_name),),
+    ).fetchone()
+    if row is None:
+        return None
+    out = dict(row)
+    out["plan"] = json.loads(out.pop("plan_json"))
+    out["impact"] = json.loads(out.pop("impact_json"))
     return out
 
 

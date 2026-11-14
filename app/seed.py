@@ -23,7 +23,8 @@ def ensure_seed(conn, sample_dir: Path | None = None, seed_run: bool = True) -> 
         conn.execute("SELECT COUNT(*) FROM schemas").fetchone()[0],
     )
     expected = (len(sample_scripts) + len(broken_scripts), len(schema_files))
-    if version == settings.SEED_VERSION and counts == expected:
+    version_changed = version != settings.SEED_VERSION
+    if not version_changed and counts == expected:
         return {
             "seeded": False,
             "reason": "seed_version 命中，跳过",
@@ -56,7 +57,8 @@ def ensure_seed(conn, sample_dir: Path | None = None, seed_run: bool = True) -> 
         store.set_meta(conn, "seed_version", settings.SEED_VERSION)
 
     baseline = store.get_meta(conn, "baseline_run_id")
-    if seed_run and not baseline:
+    if seed_run and (not baseline or version_changed):
+        # 版本升级（如新增约束引用解析）后重跑基线，让基线结论带上新能力的数据
         run_id, _ = pipeline.run_sample(conn, sample_dir)
         store.set_meta(conn, "baseline_run_id", run_id)
         baseline = run_id

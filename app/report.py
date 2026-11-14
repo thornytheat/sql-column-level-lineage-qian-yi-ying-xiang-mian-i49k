@@ -91,7 +91,37 @@ def grouped_columns(column_edges: list[dict]) -> list[dict]:
     return result
 
 
-def export_payload(run: dict, scripts: list[dict], table_edges: list[dict], column_edges: list[dict], cycles: list[dict]) -> dict:
+USAGE_LABELS = {"output": "输出", "join": "关联", "filter": "筛选", "group": "分组"}
+
+
+def grouped_usages(usages: list[dict]) -> list[dict]:
+    """约束引用按目标对象分组（结果页「约束引用」页签）。"""
+    groups: dict[str, dict] = {}
+    for u in usages:
+        group = groups.setdefault(
+            u["target_table"],
+            {"target_table": u["target_table"], "refs": []},
+        )
+        group["refs"].append(
+            {
+                "usage": u["usage"],
+                "usage_label": USAGE_LABELS.get(u["usage"], u["usage"]),
+                "source": f"{u['source_table']}.{u['source_column']}",
+                "source_table": u["source_table"],
+                "source_column": u["source_column"],
+                "expr": u["expr"],
+                "evidence": f"{u['script']}:{u['line']}",
+            }
+        )
+    result = list(groups.values())
+    for group in result:
+        group["refs"].sort(key=lambda r: (r["evidence"], r["source"]))
+        group["ref_count"] = len(group["refs"])
+    result.sort(key=lambda g: g["target_table"])
+    return result
+
+
+def export_payload(run: dict, scripts: list[dict], table_edges: list[dict], column_edges: list[dict], cycles: list[dict], usages: list[dict] | None = None) -> dict:
     return {
         "app": "lineagex",
         "run": run,
@@ -112,6 +142,7 @@ def export_payload(run: dict, scripts: list[dict], table_edges: list[dict], colu
         ],
         "table_edges": table_edges,
         "column_edges": column_edges,
+        "usages": usages or [],
         "cycles": cycles,
     }
 

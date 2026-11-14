@@ -47,9 +47,53 @@ def test_join_and_on_is_not_a_column_ref(sample_dir):
     stmt = parser.parse_script(_read(sample_dir, "05_dws_customer_order.sql"), "05.sql")
     aliases = [r.alias for r in stmt.select.froms]
     assert aliases == ["c", "o"]
-    # ON 条件不参与血缘，不应出现在选择列表的 refs 里
+    # ON 条件不参与输出列血缘，不应出现在选择列表的 refs 里
     refs = [r.column for item in stmt.select.items for r in item.refs]
     assert refs == ["customer_id", "customer_name", "order_id", "amount", "status"]
+
+
+def test_join_on_and_where_become_constraint_refs(sample_dir):
+    stmt = parser.parse_script(_read(sample_dir, "05_dws_customer_order.sql"), "05.sql")
+    joins = [c for c in stmt.select.constraints if c.usage == "join"]
+    filters = [c for c in stmt.select.constraints if c.usage == "filter"]
+    assert len(joins) == 1
+    assert [(r.qualifier, r.column) for r in joins[0].refs] == [
+        ("c", "customer_id"),
+        ("o", "customer_id"),
+    ]
+    assert len(filters) == 1
+    assert [(r.qualifier, r.column) for r in filters[0].refs] == [("o", "status")]
+    assert filters[0].expr == "o.status = 'paid'"
+
+
+def test_group_by_becomes_constraint_ref(sample_dir):
+    stmt = parser.parse_script(_read(sample_dir, "09_ads_category_report.sql"), "09.sql")
+    groups = [c for c in stmt.select.constraints if c.usage == "group"]
+    assert len(groups) == 1
+    assert [(r.qualifier, r.column) for r in groups[0].refs] == [("s", "category")]
+    # 子查询里的 JOIN 条件归属子查询自身
+    sub = stmt.select.froms[0].subquery
+    sub_joins = [c for c in sub.constraints if c.usage == "join"]
+    assert len(sub_joins) == 1
+    assert [(r.qualifier, r.column) for r in sub_joins[0].refs] == [("i", "sku"), ("p", "sku")]
+
+
+def test_where_subquery_is_not_tracked():
+    sql = (
+        "CREATE VIEW v AS SELECT o.order_id FROM ods_orders o "
+        "WHERE o.channel IN (SELECT channel FROM dim_x);"
+    )
+    stmt = parser.parse_script(sql, "in.sql")
+    filters = [c for c in stmt.select.constraints if c.usage == "filter"]
+    # IN 子查询整体跳过：只保留外层引用，不把子查询内部列算进外层来源
+    assert [(r.qualifier, r.column) for r in filters[0].refs] == [("o", "channel")]
+
+
+def test_group_by_ordinal_is_ignored():
+    sql = "CREATE VIEW v AS SELECT o.channel FROM ods_orders o GROUP BY 1, o.channel;"
+    stmt = parser.parse_script(sql, "gb.sql")
+    groups = [c for c in stmt.select.constraints if c.usage == "group"]
+    assert [(r.qualifier, r.column) for r in groups[0].refs] == [("o", "channel")]
 
 
 def test_union_all_keeps_both_branches(sample_dir):

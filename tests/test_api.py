@@ -15,6 +15,12 @@ SELECT
 FROM ods_orders o;
 """
 
+ID_ONLY_SQL = """CREATE TABLE ads_order_id_only AS
+SELECT
+  o.order_id AS order_id
+FROM ods_orders o;
+"""
+
 
 def test_health(client):
     res = client.get("/health")
@@ -134,6 +140,65 @@ def test_migration_rename_requires_new_name(client, sample_run_id):
     )
     assert res.status_code == 400
     assert "new_name" in res.json()["detail"]
+
+
+def test_impact_api_covers_constraint_refs(client, sample_run_id):
+    """只出现在 JOIN 条件里的列，影响面也要给出下游对象。"""
+    res = client.post(
+        "/api/impact",
+        json={"run_id": sample_run_id, "table": "dws_customer_order", "column": "customer_id"},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    objects = {it["object"]: it for it in body["downstream"]}
+    assert objects["ads_customer_rank"]["usages"] == ["join"]
+    assert body["constraint_count"] == 1
+
+
+def test_migration_plan_upsert_and_stale(client, sample_run_id):
+    """同一变更重跑只更新原方案；演练失败保留旧版结论，不计数、不覆盖。"""
+    payload = {"table": "ods_orders", "column": "amount", "operation": "drop"}
+    first = client.post("/api/migration", json={"run_id": sample_run_id, **payload})
+    assert first.status_code == 200, first.text
+    p1 = first.json()
+    assert p1["stale"] is False
+    base = p1["drill_count"]
+
+    # 重跑同一变更：同一个 plan_id，步骤整体替换、不新增重复步骤
+    p2 = client.post("/api/migration", json={"run_id": sample_run_id, **payload}).json()
+    assert p2["plan_id"] == p1["plan_id"]
+    assert p2["drill_count"] == base + 1
+    assert p2["step_count"] == p1["step_count"] == 6
+    assert [s["title"] for s in p2["steps"]] == [s["title"] for s in p1["steps"]]
+
+    # 演练失败（新运行里该列没有任何下游）：保留旧版结论，不覆盖、不计数
+    run2 = client.post(
+        "/api/runs", json={"mode": "custom", "sql": ID_ONLY_SQL, "filename": "id_only.sql"}
+    ).json()["run_id"]
+    stale = client.post("/api/migration", json={"run_id": run2, **payload})
+    assert stale.status_code == 200, stale.text
+    p3 = stale.json()
+    assert p3["stale"] is True
+    assert p3["plan_id"] == p1["plan_id"]
+    assert p3["drill_count"] == base + 1
+    assert p3["step_count"] == 6
+    assert "旧版结论" in p3["stale_reason"]
+
+    # 修正后重跑同一变更：仍然只更新原方案
+    p4 = client.post("/api/migration", json={"run_id": sample_run_id, **payload}).json()
+    assert p4["stale"] is False
+    assert p4["plan_id"] == p1["plan_id"]
+    assert p4["drill_count"] == base + 2
+
+
+def test_migration_drill_failure_without_history_is_400(client, sample_run_id):
+    """没有历史方案可保留时，演练失败照常报 400。"""
+    res = client.post(
+        "/api/migration",
+        json={"run_id": sample_run_id, "table": "dim_date", "column": "date_key", "operation": "drop"},
+    )
+    assert res.status_code == 400
+    assert "没有任何下游边" in res.json()["detail"]
 
 
 def test_unknown_run_is_404(client):

@@ -232,6 +232,7 @@ def result_page(request: Request, run_id: str):
             return templates.TemplateResponse(request, "result.html", ctx, status_code=404)
         run = data["run"]
         groups = report.grouped_columns(data["column_edges"])
+        usage_groups = report.grouped_usages(data.get("usages", []))
         failures = report.failed_scripts(data["scripts"])
         table_groups: dict[str, list[dict]] = {}
         for e in data["table_edges"]:
@@ -247,6 +248,7 @@ def result_page(request: Request, run_id: str):
                 "run_id": run_id,
                 "scripts": data["scripts"],
                 "column_groups": groups,
+                "usage_groups": usage_groups,
                 "table_groups": dict(sorted(table_groups.items())),
                 "cycles": [c for c in data["cycles"] if c["level"] == "table"],
                 "column_cycles": [c for c in data["cycles"] if c["level"] == "column"],
@@ -294,13 +296,48 @@ def review_page(
         impact = None
         migration = None
         page_error = None
+        stale_reason = None
         if table_choice:
             impact = graph.impact(
-                data["table_edges"], data["column_edges"], levels, table_choice, column_choice or None
+                data["table_edges"], data["column_edges"], levels, table_choice, column_choice or None,
+                usages=data.get("usages", []),
             )
-            if not impact["found"]:
-                page_error = impact["message"]
-            migration = migrate.plan_migration(impact, op, new_name, data["cycles"])
+            if impact["found"]:
+                migration = migrate.plan_migration(impact, op, new_name, data["cycles"])
+                if column_choice:
+                    # 演练成功：同一变更就地更新原方案（步骤整体替换，不新增重复步骤）
+                    stored = store.save_plan(
+                        conn,
+                        table=table_choice,
+                        column=column_choice,
+                        operation=op,
+                        new_name=new_name or None,
+                        run_id=target_run,
+                        plan=migration,
+                        impact=impact,
+                    )
+                    migration["plan_id"] = stored["plan_id"]
+                    migration["drill_count"] = stored["drill_count"]
+                    migration["updated_at"] = stored["updated_at"]
+                    migration["stale"] = False
+            else:
+                stored = (
+                    store.load_plan(conn, table=table_choice, column=column_choice, operation=op, new_name=new_name or None)
+                    if column_choice
+                    else None
+                )
+                if stored is not None:
+                    # 演练失败：保留旧版结论，不覆盖、不计数
+                    stale_reason = impact["message"]
+                    impact = stored["impact"]
+                    impact["stale"] = True
+                    migration = stored["plan"]
+                    migration["plan_id"] = stored["plan_id"]
+                    migration["drill_count"] = stored["drill_count"]
+                    migration["updated_at"] = stored["updated_at"]
+                    migration["stale"] = True
+                else:
+                    page_error = impact["message"]
         ctx = base_context(request, "review")
         ctx.update(
             {
@@ -315,6 +352,7 @@ def review_page(
                 "new_name": new_name or "",
                 "impact": impact,
                 "migration": migration,
+                "stale_reason": stale_reason,
                 "cycles": data["cycles"],
                 "error": page_error,
             }
@@ -370,6 +408,7 @@ def api_create_run(payload: dict = Body(default={})):
             "failed_count": data["run"]["failed_count"],
             "table_edge_count": data["run"]["table_edge_count"],
             "column_edge_count": data["run"]["column_edge_count"],
+            "usage_count": len(analysis.get("usages", [])),
             "cycle_count": data["run"]["cycle_count"],
             "diagnostics": _errors_payload(analysis),
         }
@@ -412,6 +451,7 @@ def api_get_run(run_id: str):
             ],
             "table_edges": data["table_edges"],
             "column_edge_count": len(data["column_edges"]),
+            "usage_count": len(data.get("usages", [])),
             "column_groups": report.grouped_columns(data["column_edges"]),
             "cycles": data["cycles"],
             "levels": {k: v for k, v in levels.items()},
@@ -449,7 +489,10 @@ def _impact_for(run_id: str, table: str, column: str | None) -> tuple[dict, dict
             raise HTTPException(status_code=404, detail=f"找不到运行记录 {run_id}")
         if not table:
             raise HTTPException(status_code=400, detail="缺少 table 参数（例如 ods_orders）")
-        impact = graph.impact(data["table_edges"], data["column_edges"], levels, table, column or None)
+        impact = graph.impact(
+            data["table_edges"], data["column_edges"], levels, table, column or None,
+            usages=data.get("usages", []),
+        )
         return data, levels, impact
     finally:
         conn.close()
@@ -482,13 +525,52 @@ def api_migration(payload: dict = Body(default={})):
         raise HTTPException(status_code=400, detail="迁移清单必须指定列，例如 ods_orders.amount")
     if operation == "rename" and not new_name:
         raise HTTPException(status_code=400, detail="改名操作必须提供 new_name")
-    data, levels, impact = _impact_for(run_id, table, column)
-    if not impact["found"]:
+    conn = get_conn()
+    try:
+        data, levels = _run_graph(conn, run_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"找不到运行记录 {run_id}")
+        impact = graph.impact(
+            data["table_edges"], data["column_edges"], levels, table, column,
+            usages=data.get("usages", []),
+        )
+        if impact["found"]:
+            # 演练成功：同一变更只更新原方案，步骤整体替换，不新增重复步骤
+            plan = migrate.plan_migration(impact, operation, new_name, data["cycles"])
+            stored = store.save_plan(
+                conn,
+                table=table,
+                column=column,
+                operation=operation,
+                new_name=new_name,
+                run_id=run_id,
+                plan=plan,
+                impact=impact,
+            )
+            plan["run_id"] = run_id
+            plan["impact"] = impact
+            plan["plan_id"] = stored["plan_id"]
+            plan["drill_count"] = stored["drill_count"]
+            plan["updated_at"] = stored["updated_at"]
+            plan["stale"] = False
+            return plan
+        stored = store.load_plan(conn, table=table, column=column, operation=operation, new_name=new_name)
+        if stored is not None:
+            # 演练失败：保留旧版结论返回，不覆盖、不计数
+            plan = stored["plan"]
+            plan["run_id"] = stored["run_id"]
+            plan["impact"] = stored["impact"]
+            plan["plan_id"] = stored["plan_id"]
+            plan["drill_count"] = stored["drill_count"]
+            plan["updated_at"] = stored["updated_at"]
+            plan["stale"] = True
+            plan["stale_reason"] = (
+                f"本次演练失败：{impact['message']}；以下为 {stored['updated_at']} 保留的旧版结论。"
+            )
+            return plan
         raise HTTPException(status_code=400, detail=impact["message"])
-    plan = migrate.plan_migration(impact, operation, new_name, data["cycles"])
-    plan["run_id"] = run_id
-    plan["impact"] = impact
-    return plan
+    finally:
+        conn.close()
 
 
 @app.get("/api/runs/{run_id}/export")
@@ -508,7 +590,8 @@ def api_export(run_id: str, format: str = "json"):
                 },
             )
         payload = report.export_payload(
-            data["run"], data["scripts"], data["table_edges"], data["column_edges"], data["cycles"]
+            data["run"], data["scripts"], data["table_edges"], data["column_edges"], data["cycles"],
+            usages=data.get("usages", []),
         )
         return Response(
             content=report.dump_json(payload),

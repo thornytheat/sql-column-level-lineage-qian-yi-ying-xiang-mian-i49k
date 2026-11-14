@@ -181,6 +181,18 @@ def _level_sort_key(level: int | None) -> int:
     return 10_000 if level is None else level
 
 
+# 用途展示顺序：输出列 → 关联条件 → 筛选条件 → 分组条件
+_USAGE_ORDER = ["output", "join", "filter", "group"]
+
+
+def _usage_index(usages) -> dict[str, list]:
+    """约束引用按「表.列」索引，键与列级节点（source_table.source_column）一致。"""
+    idx: dict[str, list] = {}
+    for u in usages or []:
+        idx.setdefault(f"{_f(u, 'source_table')}.{_f(u, 'source_column')}", []).append(u)
+    return idx
+
+
 def impact(
     table_edges,
     column_edges,
@@ -188,8 +200,13 @@ def impact(
     table: str,
     column: str | None = None,
     max_depth: int = 10,
+    usages=None,
 ) -> dict:
-    """输入表或列 → 下游对象清单（按拓扑层级排序，标注直接 / 间接）。"""
+    """输入表或列 → 下游对象清单（按拓扑层级排序，标注直接 / 间接）。
+
+    影响面 = 输出列血缘（SELECT 派生）+ 约束引用（JOIN ON / WHERE / GROUP BY）：
+    列只出现在约束条件里的对象同样会被删列击穿，必须纳入；同一对象按用途合并。
+    """
     target_kind = {}
     for e in table_edges:
         target_kind[_f(e, "target_table")] = _f(e, "target_kind")
@@ -198,15 +215,51 @@ def impact(
 
     column_adj = column_adjacency(column_edges)
     table_adj = table_adjacency(table_edges)
+    usage_by_col = _usage_index(usages)
     seed_columns = sorted(
         {_f(e, "source_column") for e in column_edges if _f(e, "source_table") == table}
     )
 
+    def new_entry(obj: str, dist: int) -> dict:
+        return {
+            "object": obj,
+            "kind": target_kind.get(obj, "unknown"),
+            "level": levels.get(obj),
+            "distance": dist,
+            "columns": [],
+            "constraint_refs": [],
+            "_usage_set": set(),
+        }
+
+    def absorb_usages(objects: dict[str, dict], node: str, dist: int) -> int:
+        """把 node 列上的约束引用并入受影响对象；返回并入的引用条数。"""
+        count = 0
+        for u in usage_by_col.get(node, ()):
+            obj = _f(u, "target_table")
+            if obj == table:
+                continue
+            entry = objects.setdefault(obj, new_entry(obj, dist))
+            entry["distance"] = min(entry["distance"], dist)
+            entry["constraint_refs"].append(
+                {
+                    "usage": _f(u, "usage"),
+                    "column": _f(u, "source_column"),
+                    "expr": _f(u, "expr"),
+                    "script": _f(u, "script"),
+                    "line": _f(u, "line"),
+                }
+            )
+            entry["_usage_set"].add(_f(u, "usage"))
+            count += 1
+        return count
+
+    constraint_count = 0
     if column:
         start = f"{table}.{column}"
-        if start not in column_adj and not any(
+        has_output = start in column_adj or any(
             _f(e, "source_table") == table and _f(e, "source_column") == column for e in column_edges
-        ):
+        )
+        if not has_output and start not in usage_by_col:
             return {
                 "seed": start,
                 "found": False,
@@ -214,7 +267,7 @@ def impact(
                 "object_count": 0,
                 "column_count": 0,
                 "max_level": 0,
-                "message": f"{table}.{column} 在血缘图中没有任何下游边（可能是叶子列或拼写有误）",
+                "message": f"{table}.{column} 在血缘图中没有任何下游边或约束条件引用（可能是叶子列或拼写有误）",
             }
         col_dist = _bfs(column_adj, [start], max_depth)
         objects: dict[str, dict] = {}
@@ -223,18 +276,11 @@ def impact(
                 continue
             obj = column_key_to_table(node)
             col = node.rsplit(".", 1)[1]
-            entry = objects.setdefault(
-                obj,
-                {
-                    "object": obj,
-                    "kind": target_kind.get(obj, "unknown"),
-                    "level": levels.get(obj),
-                    "distance": dist,
-                    "columns": [],
-                },
-            )
+            entry = objects.setdefault(obj, new_entry(obj, dist))
             entry["distance"] = min(entry["distance"], dist)
             entry["columns"].append(col)
+        for node, dist in col_dist.items():
+            constraint_count += absorb_usages(objects, node, dist + 1)
         items = list(objects.values())
         column_count = len({n for n in col_dist if n != start})
     else:
@@ -248,30 +294,31 @@ def impact(
         for obj, dist in table_dist.items():
             if obj == table:
                 continue
-            objects[obj] = {
-                "object": obj,
-                "kind": target_kind.get(obj, "unknown"),
-                "level": levels.get(obj),
-                "distance": dist,
-                "columns": [],
-            }
+            objects[obj] = new_entry(obj, dist)
         for node in col_dist:
             obj = column_key_to_table(node)
             if obj in objects and obj != table:
                 objects[obj]["columns"].append(node.rsplit(".", 1)[1])
+        for node, dist in col_dist.items():
+            constraint_count += absorb_usages(objects, node, dist + 1)
         items = list(objects.values())
         column_count = len([n for n in col_dist if column_key_to_table(n) != table])
 
     for item in items:
         item["columns"] = sorted(set(item["columns"]))
         item["relation"] = "direct" if item["distance"] == 1 else "indirect"
-        item["evidence"] = sorted(
-            {
-                f"{_f(e, 'script')}:{_f(e, 'line')}"
-                for e in column_edges
-                if _f(e, "target_table") == item["object"] and _f(e, "target_column") in item["columns"]
-            }
-        )
+        usage_set = item.pop("_usage_set")
+        if item["columns"]:
+            usage_set.add("output")
+        item["usages"] = [u for u in _USAGE_ORDER if u in usage_set]
+        item["constraint_refs"].sort(key=lambda r: (r["script"], r["line"]))
+        evidence = {
+            f"{_f(e, 'script')}:{_f(e, 'line')}"
+            for e in column_edges
+            if _f(e, "target_table") == item["object"] and _f(e, "target_column") in item["columns"]
+        }
+        evidence |= {f"{r['script']}:{r['line']}" for r in item["constraint_refs"]}
+        item["evidence"] = sorted(evidence)
     items.sort(key=lambda it: (_level_sort_key(it["level"]), it["distance"], it["object"]))
 
     level_values = [it["level"] for it in items if it["level"] is not None]
@@ -283,6 +330,7 @@ def impact(
         "downstream": items,
         "object_count": len(items),
         "column_count": column_count,
+        "constraint_count": constraint_count,
         "direct_count": sum(1 for it in items if it["relation"] == "direct"),
         "indirect_count": sum(1 for it in items if it["relation"] == "indirect"),
         "max_level": max(level_values) if level_values else 0,

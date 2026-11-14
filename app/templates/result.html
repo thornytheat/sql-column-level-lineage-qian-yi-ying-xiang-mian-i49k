@@ -57,6 +57,11 @@
     <div class="k-value">{{ run.column_edge_count }}</div>
     <div class="k-note">SELECT * 展开 {{ star_edge_count }} 条 · 函数变换 {{ transform_edge_count }} 条</div>
   </div>
+  <div class="kpi">
+    <div class="k-label">约束引用</div>
+    <div class="k-value">{{ usage_groups|map(attribute='ref_count')|sum }}</div>
+    <div class="k-note">JOIN / WHERE / GROUP BY 里的列引用</div>
+  </div>
   <div class="kpi {% if cycles %}err{% endif %}">
     <div class="k-label">依赖环</div>
     <div class="k-value">{{ cycles|length }}</div>
@@ -68,6 +73,7 @@
   <div class="panel-head">
     <div class="segmented">
       <button type="button" data-tab-target="tab-lineage" class="active">列级血缘</button>
+      <button type="button" data-tab-target="tab-usages">约束引用</button>
       <button type="button" data-tab-target="tab-cycles">环</button>
       <button type="button" data-tab-target="tab-impact">影响面</button>
       <button type="button" data-tab-target="tab-diagnostics">解析诊断</button>
@@ -110,6 +116,36 @@
     </div>
     <div class="panel-actions">
       <span class="small muted" style="align-self:center">按目标表分组的列级血缘：每条边都带依据（脚本:行号、原表达式、函数变换链）；<span class="tag warn">* 展开</span> 表示该边来自 SELECT *。</span>
+    </div>
+  </div>
+
+  <div id="tab-usages" class="tab-panel" hidden>
+    <div class="panel-body tight">
+      <p class="small muted">JOIN ON / WHERE / GROUP BY 条件里的列引用：不产出下游列，但删列后这些对象会直接失败，影响面与迁移清单已把它们一并纳入。</p>
+      {% if usage_groups %}
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead>
+            <tr><th>目标对象</th><th>用途</th><th>引用列</th><th>表达式</th><th>依据</th></tr>
+          </thead>
+          <tbody>
+            {% for g in usage_groups %}
+              {% for r in g.refs %}
+              <tr>
+                <td class="mono nowrap">{{ g.target_table }}</td>
+                <td><span class="tag warn">{{ r.usage_label }}</span></td>
+                <td class="mono nowrap">{{ r.source }}</td>
+                <td class="mono small">{{ r.expr }}</td>
+                <td class="small mono nowrap">{{ r.evidence }}</td>
+              </tr>
+              {% endfor %}
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty"><strong>本次运行没有约束条件引用</strong>脚本里没有 JOIN ON / WHERE / GROUP BY 的列引用。</div>
+      {% endif %}
     </div>
   </div>
 

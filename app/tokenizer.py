@@ -39,6 +39,7 @@ class Token:
     line: int
     col: int
     offset: int
+    end: int = 0  # 源码中 token 结束位置的偏移（字符串含引号），0 表示未知
 
     def is_punct(self, ch: str) -> bool:
         return self.kind == "punct" and self.text == ch
@@ -106,7 +107,7 @@ def tokenize(sql: str) -> list[Token]:
                 advance()
             if not closed:
                 raise LexError("字符串常量未闭合，缺少结束单引号", start_line, start_col)
-            tokens.append(Token("string", "".join(buf), "".join(buf), start_line, start_col, start_off))
+            tokens.append(Token("string", "".join(buf), "".join(buf), start_line, start_col, start_off, i))
             continue
 
         # 带引号的标识符
@@ -124,7 +125,7 @@ def tokenize(sql: str) -> list[Token]:
             if not closed:
                 raise LexError('带引号的标识符未闭合，缺少结束双引号', start_line, start_col)
             name = "".join(buf)
-            tokens.append(Token("ident", name, name.upper(), start_line, start_col, start_off))
+            tokens.append(Token("ident", name, name.upper(), start_line, start_col, start_off, i))
             continue
 
         # 数字
@@ -135,7 +136,7 @@ def tokenize(sql: str) -> list[Token]:
                 buf.append(sql[i])
                 advance()
             text = "".join(buf)
-            tokens.append(Token("number", text, text, start_line, start_col, start_off))
+            tokens.append(Token("number", text, text, start_line, start_col, start_off, i))
             continue
 
         # 标识符 / 关键字
@@ -148,15 +149,15 @@ def tokenize(sql: str) -> list[Token]:
             text = "".join(buf)
             upper = text.upper()
             kind = "keyword" if upper in KEYWORDS else "ident"
-            tokens.append(Token(kind, text, upper, start_line, start_col, start_off))
+            tokens.append(Token(kind, text, upper, start_line, start_col, start_off, i))
             continue
 
         if ch in PUNCT:
-            tokens.append(Token("punct", ch, ch, start_line, start_col, start_off))
+            tokens.append(Token("punct", ch, ch, start_line, start_col, start_off, i))
             advance()
             continue
 
         raise LexError(f"无法识别的字符 {ch!r}", start_line, start_col)
 
-    tokens.append(Token("eof", "", "", line, col, n))
+    tokens.append(Token("eof", "", "", line, col, n, n))
     return tokens

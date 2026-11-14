@@ -5,7 +5,8 @@
 - 选择列表（含 AS 别名、隐式别名、函数包裹、t.* 与 *）
 - FROM 单表 / 多表 / JOIN ... ON / 嵌套子查询
 - UNION ALL（多分支按列序号对齐）
-- WHERE / GROUP BY / ORDER BY / LIMIT 仅做结构跳过，不参与血缘
+- JOIN ON / USING、WHERE、GROUP BY 里的列引用记为「约束引用」（影响面用，不产出列级边）；
+  ORDER BY / HAVING / LIMIT 仅做结构跳过，不参与血缘
 
 语法不支持或写错时抛 ParseError（带行、列与中文原因），pipeline 会把它
 记成「解析失败」的诊断，绝不静默跳过。
@@ -55,11 +56,27 @@ class TableRef:
 
 
 @dataclass
+class ConstraintRef:
+    """约束条件（JOIN ON/USING、WHERE、GROUP BY）里的列引用。
+
+    不产出「源列 → 目标列」的血缘边，只记录「哪个对象以什么用途引用了源列」，
+    供影响面把仅出现在关联 / 筛选 / 分组条件里的列纳入下游范围。
+    """
+
+    usage: str  # join | filter | group
+    expr: str
+    line: int
+    col: int
+    refs: list[ColumnRef] = field(default_factory=list)
+
+
+@dataclass
 class Select:
     items: list[SelectItem]
     froms: list[TableRef]
     unions: list["Select"]
     line: int
+    constraints: list[ConstraintRef] = field(default_factory=list)
 
     def branches(self) -> list["Select"]:
         return [self] + list(self.unions)
@@ -147,6 +164,55 @@ def _match_paren(tokens: list[Token], start: int) -> int:
     raise ParseError("子查询括号未闭合，缺少与之匹配的 )", open_tok.line, open_tok.col)
 
 
+def _expr_text(sql: str, tokens: list[Token]) -> str:
+    """按 token 偏移从原 SQL 截取表达式文本（保留原始写法，作证据展示）。"""
+    if not tokens:
+        return ""
+    last = tokens[-1]
+    end = last.end or last.offset + len(last.text)
+    return sql[tokens[0].offset: end].strip()
+
+
+def _extract_refs(expr_tokens: list[Token]) -> list[ColumnRef]:
+    """从一段表达式 token 中提取列引用（限定符.列名 / 裸列名）。
+
+    - 函数名（ident 后紧跟 `(`）不是列引用，跳过；
+    - `(... SELECT ...)` 子查询整体跳过：相关子查询（IN / EXISTS 等）不在血缘范围内，
+      其内部列不归属外层来源表，避免误报。
+    """
+    refs: list[ColumnRef] = []
+    k = 0
+    while k < len(expr_tokens):
+        t = expr_tokens[k]
+        if t.is_punct("("):
+            nxt = expr_tokens[k + 1] if k + 1 < len(expr_tokens) else None
+            if nxt is not None and nxt.is_kw("SELECT"):
+                k = _match_paren(expr_tokens, k) + 1
+                continue
+        if t.kind == "ident":
+            nxt = expr_tokens[k + 1] if k + 1 < len(expr_tokens) else None
+            prev = expr_tokens[k - 1] if k > 0 else None
+            if nxt is not None and nxt.is_punct("("):
+                k += 1
+                continue
+            if prev is not None and prev.is_punct("."):
+                k += 1
+                continue
+            if nxt is not None and nxt.is_punct("."):
+                col_tok = expr_tokens[k + 2] if k + 2 < len(expr_tokens) else None
+                if col_tok is not None and col_tok.kind == "ident":
+                    refs.append(
+                        ColumnRef(qualifier=t.text, column=col_tok.text, line=col_tok.line, col=col_tok.col)
+                    )
+                    k += 3
+                    continue
+                k += 1
+                continue
+            refs.append(ColumnRef(None, t.text, t.line, t.col))
+        k += 1
+    return refs
+
+
 def _relation_name(tokens: list[Token], i: int) -> tuple[str, int]:
     t = tokens[i]
     if t.kind != "ident":
@@ -214,8 +280,7 @@ def _parse_item(sql: str, part: list[Token]) -> SelectItem:
     if not expr_tokens:
         raise ParseError("选择列表中存在空表达式", first.line, first.col)
 
-    last = expr_tokens[-1]
-    expr = sql[expr_tokens[0].offset: last.offset + len(last.text)].strip()
+    expr = _expr_text(sql, expr_tokens)
 
     refs: list[ColumnRef] = []
     transforms: list[str] = []
@@ -269,8 +334,10 @@ def _parse_items(sql: str, tokens: list[Token]) -> list[SelectItem]:
 # FROM 子句
 # --------------------------------------------------------------------------
 
-def _parse_from(sql: str, tokens: list[Token]) -> list[TableRef]:
+def _parse_from(sql: str, tokens: list[Token]) -> tuple[list[TableRef], list[ConstraintRef]]:
+    """解析 FROM 子句：返回（来源表 / 子查询列表，JOIN ON/USING 条件里的约束引用）。"""
     refs: list[TableRef] = []
+    constraints: list[ConstraintRef] = []
     i = 0
     n = len(tokens)
     skip_kw = ("LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "JOIN")
@@ -282,6 +349,7 @@ def _parse_from(sql: str, tokens: list[Token]) -> list[TableRef]:
             i += 1
             continue
         if t.is_kw("ON", "USING"):
+            cond_start = i + 1
             i += 1
             depth = 0
             while i < n:
@@ -297,6 +365,17 @@ def _parse_from(sql: str, tokens: list[Token]) -> list[TableRef]:
                 ):
                     break
                 i += 1
+            cond_tokens = tokens[cond_start:i]
+            if cond_tokens:
+                constraints.append(
+                    ConstraintRef(
+                        usage="join",
+                        expr=_expr_text(sql, cond_tokens),
+                        line=t.line,
+                        col=t.col,
+                        refs=_extract_refs(cond_tokens),
+                    )
+                )
             continue
         if t.is_punct("("):
             close = _match_paren(tokens, i)
@@ -329,7 +408,7 @@ def _parse_from(sql: str, tokens: list[Token]) -> list[TableRef]:
     if not refs:
         tok = tokens[0] if tokens else Token("eof", "", "", 1, 1, 0)
         raise ParseError("FROM 子句为空，至少需要一个来源表或子查询", tok.line, tok.col)
-    return refs
+    return refs, constraints
 
 
 # --------------------------------------------------------------------------
@@ -343,6 +422,63 @@ TYPE_NAMES = {
 }
 
 _CLAUSES = ("WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "EXCEPT", "INTERSECT")
+
+
+def _parse_clauses(
+    sql: str,
+    tokens: list[Token],
+    start: int,
+    constraints: list[ConstraintRef],
+    unions: list["Select"],
+) -> int:
+    """扫描 WHERE 起的尾句子句：WHERE/GROUP BY 提取约束引用，UNION 继续解析分支。
+
+    ORDER BY / HAVING / LIMIT 仅跳过（HAVING 引用的是输出别名，不归属来源表）。
+    返回语句结束位置（`;` 或切片末尾），供上层校验「单脚本单语句」。
+    """
+    i = start
+    n = len(tokens)
+
+    def slice_stop(idx: int) -> int:
+        # _find 未命中时去掉末尾 eof，避免把 eof 算进表达式
+        if idx >= 0:
+            return idx
+        return n - 1 if n and tokens[-1].kind == "eof" else n
+
+    while i < n:
+        t = tokens[i]
+        if t.kind == "eof" or t.is_punct(";"):
+            return i
+        if t.is_kw("WHERE"):
+            stop = slice_stop(_find(tokens, i + 1, _CLAUSES, (";",)))
+            cond = tokens[i + 1: stop]
+            constraints.append(
+                ConstraintRef("filter", _expr_text(sql, cond), t.line, t.col, _extract_refs(cond))
+            )
+            i = stop
+            continue
+        if t.is_kw("GROUP"):
+            by = tokens[i + 1] if i + 1 < n else None
+            if by is None or not by.is_kw("BY"):
+                raise ParseError("GROUP 后缺少 BY", t.line, t.col)
+            stop = slice_stop(_find(tokens, i + 2, _CLAUSES, (";",)))
+            cond = tokens[i + 2: stop]
+            constraints.append(
+                ConstraintRef("group", _expr_text(sql, cond), t.line, t.col, _extract_refs(cond))
+            )
+            i = stop
+            continue
+        if t.is_kw("UNION", "EXCEPT", "INTERSECT"):
+            k = i + 1
+            if k < n and tokens[k].is_kw("ALL", "DISTINCT"):
+                k += 1
+            branch, next_index = _parse_select(sql, tokens, k)
+            unions.append(branch)
+            return next_index
+        # ORDER BY / HAVING / LIMIT：跳过到下一个子句边界
+        stop = _find(tokens, i + 1, _CLAUSES, (";",))
+        i = stop if stop >= 0 else n
+    return n - 1 if n and tokens[-1].kind == "eof" else n
 
 
 def _parse_select(sql: str, tokens: list[Token], start: int) -> tuple[Select, int]:
@@ -374,7 +510,7 @@ def _parse_select(sql: str, tokens: list[Token], start: int) -> tuple[Select, in
         from_tokens = tokens[j:end]
         next_index = end
 
-    froms = _parse_from(sql, from_tokens)
+    froms, constraints = _parse_from(sql, from_tokens)
     unions: list[Select] = []
 
     if tail is not None and tail.kind == "keyword" and tail.upper in ("UNION", "EXCEPT", "INTERSECT"):
@@ -384,11 +520,13 @@ def _parse_select(sql: str, tokens: list[Token], start: int) -> tuple[Select, in
         branch, next_index = _parse_select(sql, tokens, k)
         unions = [branch]
     elif tail is not None and tail.kind == "keyword":
-        # WHERE / GROUP BY / ORDER BY / HAVING / LIMIT：仅跳过，不参与血缘
-        semi = _find(tokens, end, (), (";",))
-        next_index = semi if semi >= 0 else len(tokens) - 1
+        # WHERE / GROUP BY 提取约束引用；ORDER BY / HAVING / LIMIT 仅跳过
+        next_index = _parse_clauses(sql, tokens, end, constraints, unions)
 
-    return Select(items=items, froms=froms, unions=unions, line=sel_tok.line), next_index
+    return (
+        Select(items=items, froms=froms, unions=unions, line=sel_tok.line, constraints=constraints),
+        next_index,
+    )
 
 
 def _parse_statement(sql: str, tokens: list[Token], filename: str) -> tuple[Statement, int]:

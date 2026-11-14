@@ -69,6 +69,13 @@
 </section>
 
 {% if impact and impact.found %}
+{% if migration and migration.stale %}
+<div class="alert alert-info" style="margin-bottom:12px">
+  <strong>本次演练未通过，展示旧版结论。</strong>
+  {{ stale_reason }}；当前为 {{ migration.updated_at }} 保留的第 {{ migration.drill_count }} 次成功演练方案（方案 #{{ migration.plan_id }}），未被覆盖。
+  修正后重新查询同一变更，只会就地更新这份方案，不会新增重复步骤。
+</div>
+{% endif %}
 <div class="kpi-strip">
   <div class="kpi">
     <div class="k-label">下游对象</div>
@@ -78,7 +85,7 @@
   <div class="kpi">
     <div class="k-label">受影响的下游列</div>
     <div class="k-value">{{ impact.column_count }}</div>
-    <div class="k-note">按列级血缘向下传播</div>
+    <div class="k-note">按列级血缘向下传播{% if impact.constraint_count %} · 约束引用 {{ impact.constraint_count }} 处已并入{% endif %}</div>
   </div>
   <div class="kpi">
     <div class="k-label">最大拓扑层级</div>
@@ -119,18 +126,26 @@
     <div class="table-wrap roomy">
       <table class="dense" id="impact-table">
         <thead>
-          <tr><th>层级</th><th>下游对象</th><th>类型</th><th>距离</th><th>关系</th><th>受影响列</th><th>依据（脚本:行）</th></tr>
+          <tr><th>层级</th><th>下游对象</th><th>类型</th><th>距离</th><th>关系</th><th>用途</th><th>受影响列 / 约束引用</th><th>依据（脚本:行）</th></tr>
         </thead>
         <tbody>
           {% for it in impact.downstream %}
           <tr data-level="{{ 'L' ~ it.level if it.level is not none else 'cycle' }}"
-              data-search="{{ (it.object ~ ' ' ~ it.kind ~ ' ' ~ it.columns|join(' ') ~ ' ' ~ it.evidence|join(' ') ~ ' ' ~ it.relation)|lower }}">
+              data-search="{{ (it.object ~ ' ' ~ it.kind ~ ' ' ~ it.columns|join(' ') ~ ' ' ~ it.usages|join(' ') ~ ' ' ~ it.evidence|join(' ') ~ ' ' ~ it.relation)|lower }}">
             <td>{% if it.level is none %}<span class="tag err">环内</span>{% else %}L{{ it.level }}{% endif %}</td>
             <td class="mono nowrap">{{ it.object }}</td>
             <td class="nowrap">{{ '视图' if it.kind == 'view' else '表' }}</td>
             <td>{{ it.distance }}</td>
             <td>{% if it.relation == 'direct' %}<span class="tag warn">直接</span>{% else %}<span class="tag">间接</span>{% endif %}</td>
-            <td class="mono small nowrap">{{ it.columns|join(', ') }}</td>
+            <td class="nowrap">
+              {% for u in it.usages %}<span class="tag {{ 'warn' if u != 'output' else '' }}">{{ {'output':'输出','join':'关联','filter':'筛选','group':'分组'}[u] }}</span>{% endfor %}
+            </td>
+            <td class="mono small nowrap">
+              {% if it.columns %}<div>{{ it.columns|join(', ') }}</div>{% endif %}
+              {% for r in it.constraint_refs %}
+              <div class="muted">{{ {'join':'关联','filter':'筛选','group':'分组'}[r.usage] }} · {{ r.column }} <span class="mono">{{ r.expr }}</span></div>
+              {% endfor %}
+            </td>
             <td class="small mono">{% for ev in it.evidence %}<div class="nowrap">{{ ev }}</div>{% endfor %}</td>
           </tr>
           {% endfor %}
@@ -151,12 +166,16 @@
   <section class="panel pane-sticky" id="m6">
     <div class="panel-head">
       <h2>迁移清单：<span class="mono">{{ migration.table }}.{{ migration.column }}</span> · {{ '删列' if migration.operation == 'drop' else '改名' }}</h2>
-      <div class="panel-actions"><span class="tag ok">{{ migration.step_count }} 步</span></div>
+      <div class="panel-actions">
+        {% if migration.stale %}<span class="tag err">旧版结论</span>{% endif %}
+        {% if migration.drill_count %}<span class="tag">演练 #{{ migration.drill_count }}</span>{% endif %}
+        <span class="tag ok">{{ migration.step_count }} 步</span>
+      </div>
     </div>
     <div class="panel-body">
       <p class="small muted" style="margin-top:0">
         受影响对象 {{ migration.affected_objects }} 个（直接 {{ migration.direct_count }} / 间接 {{ migration.indirect_count }}），
-        其中物理表需回填 {{ migration.backfill_count }} 个。
+        其中物理表需回填 {{ migration.backfill_count }} 个{% if migration.constraint_count %}；约束条件引用 {{ migration.constraint_count }} 处{% endif %}。
       </p>
       <ol class="steps">
         {% for step in migration.steps %}
@@ -166,8 +185,10 @@
           {% if step.objects %}
           <div class="small" style="margin-top:4px">
             {% for o in step.objects %}
-            <div><span class="mono">{{ o.object }}</span>（{{ '视图' if o.kind == 'view' else '表' }}，L{{ o.level if o.level is not none else '环内' }}）：
-              <span class="mono">{{ o.columns|join(', ') }}</span>
+            <div><span class="mono">{{ o.object }}</span>（{{ '视图' if o.kind == 'view' else '表' }}，L{{ o.level if o.level is not none else '环内' }}）
+              {% for u in o.usages %}<span class="tag {{ 'warn' if u != 'output' else '' }}">{{ {'output':'输出','join':'关联','filter':'筛选','group':'分组'}[u] }}</span>{% endfor %}：
+              {% if o.columns %}<span class="mono">{{ o.columns|join(', ') }}</span>{% endif %}
+              {% for r in o.constraint_refs %}<span class="muted">{{ {'join':'关联','filter':'筛选','group':'分组'}[r.usage] }}·{{ r.column }}</span>{% endfor %}
               {% if o.evidence %}<span class="muted">· {{ o.evidence|join(', ') }}</span>{% endif %}
             </div>
             {% endfor %}

@@ -56,7 +56,8 @@ def plan_migration(
                         if operation == "rename" and new_name
                         else "新的来源列或常量"
                     )
-                    + "；本层对象只依赖第 "
+                    + "；引用位置含 SELECT 输出与 JOIN / WHERE / GROUP BY 条件（见各对象「用途」标记），"
+                    "漏改约束条件同样会让任务直接失败。本层对象只依赖第 "
                     + str(max(level - 1, 0))
                     + " 层及更上游，改写后可单独重跑验证。"
                 ),
@@ -95,7 +96,7 @@ def plan_migration(
             "order": len(steps) + 1,
             "action": "ddl",
             "title": f"在源表执行{'删列' if operation != 'rename' else '改名'}并复核",
-            "detail": f"确认下游全部改写完成后再执行：{_ddl_sql(table, column, operation, new_name)} 执行后重新解析全部脚本，确认 0 条引用了旧列。",
+            "detail": f"确认下游全部改写完成后再执行：{_ddl_sql(table, column, operation, new_name)} 执行后重新解析全部脚本，确认 0 条引用了旧列（含 SELECT 输出与 JOIN / WHERE / GROUP BY 条件）。",
             "objects": [],
         }
     )
@@ -103,6 +104,13 @@ def plan_migration(
     warnings: list[str] = []
     if not items:
         warnings.append("该列没有下游引用，可直接执行 DDL；仍建议保留一次全量脚本解析作为复核。")
+    constraint_only = [it for it in items if it.get("usages") and "output" not in it["usages"]]
+    if constraint_only:
+        warnings.append(
+            f"有 {len(constraint_only)} 个对象仅在 JOIN / WHERE / GROUP BY 中引用该列（"
+            + "、".join(it["object"] for it in constraint_only[:5])
+            + "）：不产出下游列，但删列后任务会直接失败，务必纳入改写范围。"
+        )
     if any(it["kind"] == "view" for it in items):
         warnings.append("受影响对象中包含视图：视图随定义自动生效，但需要重新解析并部署新定义，否则查询会报旧列不存在。")
     if cycles:
@@ -120,6 +128,7 @@ def plan_migration(
         "step_count": len(steps),
         "affected_objects": len(items),
         "affected_columns": impact_data.get("column_count", 0),
+        "constraint_count": impact_data.get("constraint_count", 0),
         "backfill_count": len(backfill),
         "direct_count": impact_data.get("direct_count", 0),
         "indirect_count": impact_data.get("indirect_count", 0),

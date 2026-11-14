@@ -115,3 +115,51 @@ def test_forward_reference_between_views(schemas):
     assert (edge["source_table"], edge["source_column"]) == ("v_b", "order_id")
     inner = next(e for e in result["column_edges"] if e["target_table"] == "v_b")
     assert (inner["source_table"], inner["source_column"]) == ("ods_orders", "order_id")
+
+
+def _usage(analysis, source_table, source_column, target_table, usage):
+    return [
+        u
+        for u in analysis["usages"]
+        if (u["source_table"], u["source_column"], u["target_table"], u["usage"])
+        == (source_table, source_column, target_table, usage)
+    ]
+
+
+def test_constraint_usages_resolved(analysis):
+    # 05：JOIN ON 双端 + WHERE 都解析到基表列
+    assert _usage(analysis, "dwd_order", "customer_id", "dws_customer_order", "join")
+    assert _usage(analysis, "dwd_customer", "customer_id", "dws_customer_order", "join")
+    assert _usage(analysis, "dwd_order", "status", "dws_customer_order", "filter")
+    # 04：子查询里的 WHERE 归属整条语句的目标对象
+    assert _usage(analysis, "ods_order_items", "qty", "dwd_order_item", "filter")
+    # 08：JOIN ON 引用 dim_customer.customer_id（该列没有被 SELECT）
+    assert _usage(analysis, "dim_customer", "customer_id", "dws_order_wide", "join")
+    # 09：GROUP BY 穿透子查询到 dim_product.category；JOIN 双端到两张基表
+    assert _usage(analysis, "dim_product", "category", "ads_category_report", "group")
+    assert _usage(analysis, "dim_product", "sku", "ads_category_report", "join")
+    assert _usage(analysis, "dwd_order_item", "sku", "ads_category_report", "join")
+    # 10：JOIN / GROUP BY 穿透两层子查询
+    assert _usage(analysis, "dws_customer_order", "customer_id", "ads_customer_rank", "join")
+    assert _usage(analysis, "v_customer", "customer_name", "ads_customer_rank", "group")
+
+
+def test_constraint_usage_keeps_evidence(analysis):
+    hit = _usage(analysis, "dws_customer_order", "customer_id", "ads_customer_rank", "join")
+    assert hit[0]["script"] == "10_ads_customer_rank.sql"
+    assert hit[0]["line"] > 0
+    assert "customer_id" in hit[0]["expr"]
+
+
+def test_unknown_constraint_column_is_diagnosed(schemas):
+    files = [
+        {
+            "filename": "bad_filter.sql",
+            "sql": "CREATE VIEW v_bad_filter AS\nSELECT o.order_id AS order_id\nFROM ods_orders o\nWHERE o.not_a_column = 1;\n",
+        }
+    ]
+    result = lineage.build_lineage(files, schemas)
+    assert result["failed_count"] == 1
+    diag = result["diagnostics"][0]
+    assert "not_a_column" in diag["message"]
+    assert diag["line"] == 4
